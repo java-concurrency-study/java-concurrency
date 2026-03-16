@@ -1,8 +1,8 @@
 <div align="center">
 
-# LINK
+# 모던 자바 동시성 프로그래밍
 
-### *Learn · Interact · Network · Knowledge*
+<br>
 
 [![Java](https://img.shields.io/badge/Java-21+-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
 [![Book](https://img.shields.io/badge/Book-Modern%20Concurrency%20in%20Java-0E76A8?style=for-the-badge&logo=o'reilly&logoColor=white)](https://www.oreilly.com/)
@@ -22,7 +22,6 @@
 
 ## 📖 스터디 소개
 
-LINK는 가제이며, 스터디 그룹의 이름입니다. <br>
 『모던 자바 동시성 프로그래밍』을 기반으로 주차별로 공부했던 내용을 정리해 함께 나누며 성장하는 스터디입니다.<br>
 단순히 책의 내용을 자신만의 방식으로 정리하는 것 외에도, 추가로 학습한 내용을 적어도 좋습니다. <br>
 각자 궁금했던 부분을 깊이 탐구하고 자유롭게 공유하는 것을 지향합니다.<br>
@@ -78,9 +77,5 @@ LINK는 가제이며, 스터디 그룹의 이름입니다. <br>
 ---
 
 <div align="center">
-
-*"Concurrency is not parallelism."* — Rob Pike
-
-**LINK** · Learn · Interact · Network · Knowledge
 
 </div>
