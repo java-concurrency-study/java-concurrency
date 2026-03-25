@@ -1,0 +1,529 @@
+# 가볍고 부지런한 가상 스레드
+
+<br>
+
+## 1. 가상 스레드란?
+
+- **가상 스레드**는 캐리어 스레드(`carrier thread`)에서 실행되며, 캐리어 스레드는 본질적으로 **ForkJoinPool**에서 가져온 스레드임
+
+<br>
+
+#### 📌 가상 스레드 스케줄러의 병렬성
+
+- 가상 스레드 스케줄러의 병렬성은 **가상 스레드를 실제로 실행할 수 있는 플랫폼 스레드(=캐리어 스레드)의 개수에 의해 정해짐**
+- 가상 스레드를 실행시키기 위해서는 캐리어 스레드에 `mount`되어야하고, 해당 캐리어 스레드가 CPU를 할당받아야지 실행됨
+
+```txt
+Virtual Thread
+      ↓ mount
+Platform Thread (Carrier Thread)
+      ↓
+   CPU 실행
+```
+
+<br>
+
+#### 💡jdk.virtualThreadScheduler.parallelism 설정
+
+- **jdk.virtualThreadScheduler.parallelism** 설정은 가상 스레드 스케줄러의 플랫폼 스레드(=캐리어 스레드)의 개수를 조정하는 속성
+- **Runtime.getRuntime().availableProcessors()** 의 출력값은 `8`이 나오는데, 이는 JVM에서 사용 가능한 CPU 코어 수를 나타냄
+- 참고로 가상 스레드를 실행할 플랫폼 스레드의 최대 풀 크기는 256임 `jdk.virtualThreadScheduler.maxPoolSize (default: 256)`
+
+```java
+public class Main {
+
+    public static void main(String[] args) {
+        System.setProperty("jdk.virtualThreadScheduler.parallelism", "4");
+        System.out.println(Runtime.getRuntime().availableProcessors()); // 8 (JVM에서 사용 가능한 CPU 코어 수)
+    }
+}
+```
+
+<br>
+
+#### 🧐 jdk.virtualThreadScheduler.parallelism 값이 Runtime.getRuntime().availableProcessors()의 수보다 크다면?
+
+- 만약 아래처럼 JVM에서 사용 가능한 CPU 코어수보다 가상 스레드 스케줄러의 병렬성 수를 증가시킨다면 아래와 같은 과정이 발생하여 성능상 비효율이 발생함
+    - carrier thread: 20개
+    - 실제 CPU core: 8개
+        - 20개의 `carrier thread`가 8개의 CPU를 두고 경쟁이 발생함, 따라서 context switching 비용이 증가됨
+
+```java
+public class Main {
+
+    public static void main(String[] args) {
+        System.setProperty("jdk.virtualThreadScheduler.parallelism", "20");
+        System.out.println(Runtime.getRuntime().availableProcessors()); // 8 (JVM에서 사용 가능한 CPU 코어 수)
+    }
+}
+
+availableProcessors = 8
+parallelism = 20
+```
+
+<br>
+
+### 1-1. 플랫폼 스레드
+
+- 플랫폼 스레드는 자바가 처음 만들어졌을 때부터 존재하던 Native Thread이며, 전통적인 스레드 또는 고전적인 스레드라고도 불림, JDK의 공식적인 명칭인 `플랫폼 스레드`
+- OS에 의해 실행되며, 스케줄링과 관리가 OS나 POSIX와 같은 스레드 라이브러리에 의해 관리됨
+- 자바 스레드와 커널 스레드는 1:1 매핑됨
+
+<br>
+
+### 1-2. 가상 스레드
+
+- 가상 스레드는 JVM에 의해 관리됨
+- `사용자 모드 스레드` 또는 `경량 스레드`라고 부리기도 하는 **가상 스레드**는 JDK 21부터 도입됨
+- 가상 스레드는 커널 스래드와 1:1 매핑되지 않고, 플랫폼 스레드(=캐리어 스레드)에 `mount`되어 실행됨, 따라서 적은 플랫폼 스레드로도 많은 가상 스레드를 실행시킬 수 있음
+- Virtual Thread는 기존 KLT(1) : ULT(1)의 구조가 아닌 KLT(1) : ULT(1) : Virtual Thread(N)의 구조로 사용된다. KLT와 Virtual Thread 사이의 ULT는 플랫폼 스레드라고 한다. [참고](https://d2.naver.com/helloworld/1203723)
+
+#### 🧐 플랫폼 스레드와 캐리어 스레드의 차이?
+
+- `Carrier Thread`는 본질적으로 **플랫폼 스레드**인데, 가상 스레드를 운반하는 역할을 하기 때문에 `Carrier Thread`라고 부름
+
+```
+Virtual Thread
+      ↓ mount
+Carrier Thread (Platform Thread)
+      ↓
+     CPU
+      ↓
+Virtual Thread 실행
+      ↓ blocking
+    unmount
+```
+
+<br>
+
+<img width="1032" height="516" alt="스크린샷 2026-03-16 오후 9 49 34" src="https://github.com/user-attachments/assets/ecf5ad11-7d17-4534-b16a-6209eff48278" />
+
+<br><br>
+
+### 1-3. 플랫폼 스레드와 가상 스레드의 결정적 차이
+
+#### 1. 가벼움
+
+- 가상 스레드는 플랫폼 스레드에 비해 훨씬 적은 양의 메모리를 사용하고, 시스템 자원을 더 적게 소모함
+
+  > 하나의 플랫폼 스레드를 만들기 위해서는 1개의 커널 스레드가 필요하고, **system call**과 **context-switch** 비용, 그리고 플랫폼 스레드 1개를 만들기 위해 약 1MB ~ 2MB의 Stack 메모리가 필요함 <br>
+  > 반면, 가상 스레드는 JVM 위에서 동작하며, Stack을 작은 조각으로 나눠 **Heap**에 저장함
+
+#### 2. 스케줄링
+
+- 가상 스레드는 OS의 스케줄링이 아니라 JVM에 의해 스케줄링되어 유저 스레드와 커널 스레드간 전환이 없어 오버헤드가 줄어듬
+
+#### 3. 블러킹 허용 능력
+
+- 가상 스레드는 **Blocking I/O**를 만나면 캐리어 스레드와 unmount되고, 다른 가상 스레드가 mount되어 실행됨
+
+#### 4. 자연스러운 통합
+
+- 가상 스레드는 기존 코드 베이스를 크게 변경할 필요없이 통합 가능
+
+<br>
+
+## 2. 가상 스레드 사용해보기
+
+#### 예제 코드
+
+- 플랫폼 스레드의 로그를 보면 Thread.sleep(2000)으로 설정했기 때문에 2초 간격으로 start 로그가 있을것을 알 수 있음
+- 가상 스레드의 로그를 보면 Thread.sleep(2000)으로 설정했지만 start 로그의 간격은 차이가 없음, 이를 통해 **Blocking I/O**를 만나면 캐리어 스레드에서 `umount`되고, 캐리어 스레드가 즉시 다른 가상 스레드를 실행하는 것을 알 수 있음
+
+```java
+public class Main {
+
+    public static void main(String[] args) throws InterruptedException {
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(1)) {
+            for (int i = 1; i <= 3; i++) {
+                int taskId = i;
+                executor.submit(() -> {
+                    System.out.printf("%s | %s | %s%n", LocalTime.now(), Thread.currentThread(), "task-" + taskId + " start");
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException e) {}
+                    System.out.printf("%s | %s | %s%n", LocalTime.now(), Thread.currentThread(), "task-" + taskId + " end");
+                });
+            }
+            Thread.sleep(7000);
+        }
+        /**
+         * 22:10:48.270703 | Thread[#23,pool-1-thread-1,5,main] | task-1 start
+         * 22:10:50.303468 | Thread[#23,pool-1-thread-1,5,main] | task-1 end
+         * 22:10:50.311897 | Thread[#23,pool-1-thread-1,5,main] | task-2 start
+         * 22:10:52.317395 | Thread[#23,pool-1-thread-1,5,main] | task-2 end
+         * 22:10:52.318940 | Thread[#23,pool-1-thread-1,5,main] | task-3 start
+         * 22:10:54.325550 | Thread[#23,pool-1-thread-1,5,main] | task-3 end
+         */
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 1; i <= 3; i++) {
+                int taskId = i;
+                executor.submit(() -> {
+                    System.out.printf("%s | %s | %s%n", LocalTime.now(), Thread.currentThread(), "task-" + taskId + " start");
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException e) {}
+                    System.out.printf("%s | %s | %s%n", LocalTime.now(), Thread.currentThread(), "task-" + taskId + " end");
+                });
+            }
+
+            Thread.sleep(3000);
+        }
+        /**
+         * 22:10:54.909272 | VirtualThread[#26]/runnable@ForkJoinPool-1-worker-2 | task-2 start
+         * 22:10:54.909292 | VirtualThread[#27]/runnable@ForkJoinPool-1-worker-1 | task-3 start
+         * 22:10:54.909270 | VirtualThread[#24]/runnable@ForkJoinPool-1-worker-3 | task-1 start
+         * 22:10:56.921294 | VirtualThread[#24]/runnable@ForkJoinPool-1-worker-1 | task-1 end
+         * 22:10:56.921294 | VirtualThread[#26]/runnable@ForkJoinPool-1-worker-6 | task-2 end
+         * 22:10:56.921331 | VirtualThread[#27]/runnable@ForkJoinPool-1-worker-1 | task-3 end
+         */
+    }
+}
+```
+
+<br>
+
+### 2-1. 가상 스레드의 특징
+
+#### 1. 우선순위
+
+- 가상 스레드의 우선순위는 `NORM_PRIORITY(5)`로 정해지는데, 가상 스레드에 대해 **setPriority**를 설정하더라도 우선순위는 달라지지 않음
+
+
+#### 2. 데몬 상태
+
+- 가상 스레드는 기본적으로 데몬 스레드임, **setDaemon** 메서드를 사용하여 유저 스레드로 변경하려고해도 적용되지 않음
+
+#### 3. 가상 스레드의 실행 위치
+
+- 가상 스레드를 어떤 캐리어 스레드가 실행하고 있는지 현재로서 확인할 방법 없음
+
+<br>
+
+## 3. 가상 스레드와 리틀의 법칙
+
+### 리틀의 법칙이란
+
+- 리틀의 법칙은 모든 컴퓨팅 시스템의 성능은 `지연시간`, `동시성`, `처리량` 사이에 수학적 관계를 설정함
+- 리틀의 법칙은 시스템의 성격에 구애받지 않으며, 이 법칙은 작업 수행에 걸린 시간과 대기에 걸린 시간을 구분하지 않으며, 동시성 단위가 스레드인지, CPU 코어인지 구분하지 않음
+
+> λ = N / d
+
+#### 처리량(λ)
+
+- 단위 시간당 처리되는 작업의 수(RPS, TPS)
+
+#### 동시성(N)
+
+- 동시에 처리되고 있는 작업의 평균 수
+
+#### 응답시간(d)
+
+- 단일 항목이 시작부터 완료까지 처리되는데 걸리는 평균 시간
+
+<br>
+
+#### 💡 가상 스레드와 리틀의 법칙
+
+- 기존 **native thread**는 무제한적으로 생성될 수 없기 때문에 `처리량`을 증가시키기 위해서는 `응답시간`을 줄여야하는 문제가 있었음, 하지만 **응답시간**을 줄이는 것은 결코 쉽지 않음
+- **가상 스레드**를 사용하면 `동시성`을 증가시킬 수 있기 때문에 `응답시간`을 줄이지 않고도 `처리량`을 증가시킬 수 있음
+- **가상 스레드**를 활용함으로써 I/O 집중적인 작업으로 인한 `지연시간`을 `동시성`을 증가시켜 `처리량`을 높임
+- **가상 스레드**를 사용해서 `처리량`을 개선할 수 있지만 동시에 처리해야 하는 작업이 `IO 버스트`가 아닌 `CPU 버스트`인 경우에는 **가상 스레드**가 도움이 안될 수 있음
+
+<br>
+
+#### 📌 CPU 버스트 작업에서는 가상 스레드가 효율이 없다?
+
+> 92p <br>
+> 가상 스레드는 동시에 처리해야 하는 태스크의 양이 아니라, 많은 연산 능력을 필요로 하는 CPU 집중적인 작업량이 병목 현상의 원인일 때는 가상 스레드가 전혀 도움이 되지 않는다.
+
+1. 가상 스레드는 Blocking 작업을 만나면 캐리어 스레드와 `unmount`되어 다른 가상 스레드에게 실행 기회를 주지만 **CPU 버스트** 작업인 경우에는 가상 스레드가 캐리어 스레드를 계속 점유하고 있음
+    - CPU 버스트 작업이 많은 경우에는 ForkJoinPool을 사용하거나 병렬 스트림을 생각해보자
+
+<br>
+
+## 4. 가상 스레드 내부 동작 방식
+
+### 4-1. 스택 프레임과 메모리 관리
+
+#### native thread
+
+- 전통적인 `native thread`는 OS의 커널 스레드와 1:1 매핑될 때 연속된 `Stack Frame`이 하나의 메모리 블록에 할당됨
+- 그 결과, 스레드에 필요한 스택 크기를 예측했어야함
+- 주어진 스택이 너무 작으면 **StackOverflowError**와 같은 문제가 발생하거나 반대로 주어진 스택이 너무 크면 `내부 단편화`가 발생함
+
+#### virtual thread
+
+- `virtual thread`는 `Stack Frame`이 `Chunk`단위로 쪼개져 `Heap`에 저장됨
+    - [JEP 444](https://openjdk.org/jeps/444)에서 `The stacks of virtual threads are stored in Java's garbage-collected heap as stack chunk objects` 검색
+- 가상 스레드에 필요한 스택 크기를 예측할 필요가 없음
+- 가상 스레드는 기본적으로 `Continuation` 기반이여서 실행이 중단되면 스택 상태를 `Heap`에 저장하고, 다시 재개하면 `Heap`에 있던걸 꺼내 사용함
+
+#### 💡 Continuation이란?
+
+- 지금까지 실행했던 상태를 그대로 저장해두고, 나중에 다시 실행될 때 이어서 실행할 수 있는 실행 단위
+- 즉, 어느 지점에서 멈추었고, 그때의 상태(지역 변수의 값, 호출 흐름 등)를 캡쳐해서 작업을 이어감
+- 근데 Native Thread도 같은 동작이 아닌가...?
+- 결정적인 차이점은 `작업을 재개하는 주체`인거 같음
+    - native thread는 본인이 실행되어야하는 반면에 virtual thread는 아무 캐리어 스레드에서 실행되도됨
+
+#### native thread의 context-switch
+
+- **native thread**도 `context-switch`이 발생하면 지금까지의 작업 정보(PC, CPU 레지스터 값, 스택 포인트)를 `커널 메모리 블럭(TCB)`에 저장함
+- 근데 해당 스레드의 `Stack Frame`은 메모리에 그대로 유지됨
+- 즉, 해당 스레드는 여전히 존재하고 있고 메모리에 자원을 점유하고 있음
+- 그리고 중요한 차이점이 `context-switch`은 CPU가 누구를 실행할지 바꾸는 것임
+
+#### virtual thread의 Continuation
+
+- **virtual thread**는 unmount될 때 자신의 상태를 `Heap`에 저장함
+- `Continuation`은 실행 정보 자체를 저장하고 나중에 다시 시작하는것임
+- 가장 중요한 차이점이 **virtual thread**는 실행 상태를 `Continuation`으로 스레드와 분리했기 때문에, 특정 캐리어 스레드에 종속되지 않고 어떠한 캐리어 스레드에서 작업이 재개될 수 있음
+
+#### 🤔 virtual thread의 Stack Frame은 청크 단위로 쪼개져 Heap에 저장되는데 어떻게 자신의 Stack인지 알지?
+
+- **Continuation** 객체가 스택의 루트를 들고 있고, 각 청크들이 연결 리스트로 이어져있어서 가능하다고함
+- [참고 코드](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/jdk/internal/vm/Continuation.java#L330)
+
+```txt
+Continuation
+   ↓
+[Chunk 1] → [Chunk 2] → [Chunk 3]
+```
+
+
+<br>
+
+### 4-2. 캐리어 스레드와 운영체제의 개입
+
+- OS는 가상 스레드의 존재를 알지 못함
+- 가상 스레드는 `Carrier Thread`에 **mount**되어 실행됨
+- **mount**되는 과정에서 Heap에 있는 `Stack Frame`을 Carrier Thread의 스택으로 복사함
+
+<br>
+
+### 4-3. 블로킹 연산 처리
+
+- 가상 스레드는 I/O 작업을 만나면 캐리어 스레드로부터 **unmount**되고, 가상 스레드가 가지고 있던 스택 정보는 Heap에 저장됨
+
+<br>
+
+### 4-4. 투명성과 비가시성
+
+- 가상 스레드를 mount하고 unmount하는 과정은 투명해서 자바 코드에서 보이지 않음
+- 캐리어 스레드의 **ThreadLocal** 값조차 가상 스레드에게는 안보임
+- 가상 메모리에서 사용되지 않는 메모리는 디스크로 `페이지 아웃`되는 것처럼, 사용되지 않는 가상 스레드의 스택은 `Heap`으로 아웃됨
+
+<br>
+
+### 4-5. 비동기 연산 단순화
+
+- `CompletableFuture` 클래스의 **get** 메서드를 호출하면 Blocking이 발생하지만 가상 스레드를 사용하면 이때 **unmount**되므로 과도한 자원을 소모하거나 성능 저하를 발생시키지 않음
+
+<br>
+
+### 4-6. 든든한 구조적 동시성
+
+- **JEP 505**에서 `StructuredTaskScope`이 도입됨
+- `StructuredTaskScope`을 사용하면 구조화된 영역안에서 태스크를 실행하고, 태스크 중 일부가 실패하거나 타임아웃이 발생하면 해당 영역 안에 있는 모든 태스크가 자동으로 취소되도록 설계됨
+
+#### 💡 구조적 동시성이란
+
+- 코드의 구문 구조를 사용해 서로 다른 스레드에서 실행 중인 연관된 작업들을 하나의 작업 단위로 취급하는 방식으로 이를 통해 오류 처리나 취소를 간소화하고 안정성과 관측성을 높이고자 합
+
+<br>
+
+## 5. 요청 제한을 통한 자원 제약 관리
+
+- 가상 스레드를 사용하면 수 많은 스레드들로 인해 많은 작업을 처리할 수 있지만 소프트웨어를 구성하는 각 요소들의 `부하 처리 능력`이 모두 동일하지 않기 때문에 다른 곳에서의 병목이 발생할 수 있음
+    - 데이터베이스의 한정적인 처리량
+    - 외부 자원의 Rate Limit
+
+<details>
+	<summary>예제 코드</summary>
+
+```java
+public class ResourceAwareRateLimit {
+
+    private static final HttpClient CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+
+    private static final int MAX_PARALLEL = 10;
+    private static final Semaphore gate = new Semaphore(MAX_PARALLEL);
+    private static final String API_URL = "https://api.chucknorris.io/jokes/random";
+
+    public static void main(String[] args) throws Exception {
+        Instant start = Instant.now();
+        List<String> jokes = fetchJokes(50);
+        long ms = Duration.between(start, Instant.now()).toMillis();
+
+        System.out.printf("Fetched %d jokes in %d ms (avg %d ms) %n", jokes.size(), ms, ms / jokes.size());
+
+        jokes.stream()
+                .limit(3)
+                .forEach(s -> System.out.println("- " + s));
+    }
+
+    private static List<String> fetchJokes(int n) throws Exception {
+        try (ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<String>> futures = IntStream.range(0, n)
+                    .mapToObj(it -> executorService.submit(ResourceAwareRateLimit::fetchJoke))
+                    .toList();
+
+            return futures.stream()
+                    .map(ResourceAwareRateLimit::join)
+                    .toList();
+        }
+    }
+
+    private static String fetchJoke() throws Exception {
+        var httpRequest = HttpRequest.newBuilder(URI.create(API_URL))
+                .GET()
+                .timeout(Duration.ofSeconds(30))
+                .build();
+
+        try {
+            gate.acquire();
+            HttpResponse<String> response = CLIENT.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("API Error");
+            }
+            return parseJoke(response.body());
+        } finally {
+            gate.release();
+        }
+    }
+    private static String parseJoke(String json) {
+        int s = json.indexOf("\"value\":\"") + 9;
+        int e = json.indexOf('"', s);
+
+        return json.substring(s, e).replace("\\\"", "\"");
+    }
+
+    private static <T> T join(Future<T> f) {
+        try {
+            return f.get();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+Fetched 50 jokes in 5505 ms (avg 110 ms) 
+- Chuck Norris knows theory of Everything, but if he tells you he will have to kill you.
+- Chuck Norris kills and average of 12.3 people on his way to the store
+- As a toddler, Chuck Norris built a fort out of legos. That fort was known as The Alamo.
+```
+</details>
+
+<br>
+
+### 5-1. 세마포어
+
+#### 💡 세마포어란?
+
+- 세마포어는 공유 자원에 대한 접근을 정해진 개수를 사용하여 접근을 통제하는 동기화 매커니즘
+- 세마포어는 `Signaling` 매커니즘을 사용하기 때문에 **Mutex**와 다름
+- 세마포어는 특정 스레드 소유 개념이 없기 때문에 acquire() 메서드를 호출한 스레드 아니여도 다른 스레드가 release()하여 자원을 반환할 수 있음
+    - 이로 인해 잘못 사용하면 `permit` 개수가 어긋나 동기화 오류가 발생할 수 있음
+- 세마포어는 이진 세마포어와 카운팅 세마포어로 나뉨
+
+<br>
+
+#### 📌 이진 세마포어
+
+- 이진 세마포어의 `permit`의 개수를 0과 1값만 사용함
+- 이진 세마포어는 `Mutex`와 비슷하게 동작함
+- 만약 어떠한 스레드가 **Lock**을 사용할 수 없으면 0이고, 사용할 수 있으면 1이됨, 이렇게 0 또는 1값만 가지는 세마포어를 이진 세마포어라함
+
+<br>
+
+#### 📌 카운팅 세마포어
+
+- 카운팅 세마포어는 `permit`의 개수를 0과 1이 아닌 0, 1, 2, 3, 4 ...이렇게 값을 가지는 세마포어임
+
+<br>
+
+#### 📌 wait() 메서드와 signal() 메서드
+
+- wait()와 signal() 메서드는 반드시 원자적으로 수행되어야함
+
+> wait() = P() = acquire(): 자원 요청
+
+1. 세마포어의 `permit` 개수를 1 감소시킴
+2. 만약 `permit`의 개수가 0 이상이면 해당 스레드의 작업은 실행됨
+3. 만약 `permit`의 개수가 음수이면 해당 스레드는 Blocking됨
+
+> signal() = V() = release(): 자원 반환
+
+1. 세마포어의 `permit` 개수를 1 증가시킴
+2. 대기 중인 스레드가 있으면 깨움 (기본적으로 `비공정성`으로 동작함)
+
+<br>
+
+### 5-2. Mutex
+
+#### 💡 Mutex란?
+
+- 스레드가 **임계 구역**에 진입할 때 반드시 **Lock**을 획득하고, 임계 구역을 빠져나올 때 **Lock**을 반환해야함
+- **Mutex Lock**은 `available`이라는 변수를 가지는데, 이 `available` 변수가 **Lock**의 가용 여부를 나타냄
+- 사용 불가의 **Lock**을 획득하려는 스레드가 있을 때 반복적으로 획득 시도를 함, 이를 `Spin Lock`이라 부르며 `busy waiting`으로 인해 **CPU Cycle**이 낭비되고 CPU 튀는 현상이 발생함
+
+<br>
+
+### 5-3. 세마포어와 Mutex의 차이
+
+- 세마포어에는 **이진 세미포어**라는 개념이 있는데, 그렇기 때문에 세마포어는 Mutex가 될 수 있지만 반대로 Mutex는 세마포어가 될 수 없음
+- 세마포어는 동기화의 개수를 `permit`로 조정할 수 있지만 Mutex는 오로지 1개임
+- 세마포어는 `Signaling` 매커니즘이고 Mutex는 `Locking` 매커니즘임
+
+<br>
+
+### 5-4. Redis 분산락 사용시 Lettuce와 Redisson
+
+- 레디스를 사용하여 분산락을 구현할 때 `Lettuce` 또는 `Redisson` 둘 중 하나를 사용함
+- `Lettuce`는 Redis 클라이언트이므로 락을 직접 구현해야하고, **polling** 기반의 `SpinLock` 방식임
+- `Redisson`는 고급 기능을 추가적으로 제공해주고, **Pub/Sub** 기반의 `Signaling` 방식임
+
+<br>
+
+#### 🤔 Lettuce와 Redisson 중 어떤 것을 사용해야할까?
+
+> 트래픽이 몰리는 상황이라면?
+
+    비지니스 로직에 따라 나뉠거 같음
+    비지니스 로직이 오래걸린다는 것은 Lock을 오래 잡고 있어야 하기 때문에 SpinLock 방식보다는 Signaling인 Redisson이 적합해보임
+    Lock을 오래잡고 있으면 SpinLock 사용 시 CPU가 튀지 않을까?
+
+<br> 
+
+> 네트워크 대역폭 고려
+
+    Lettuce 기반의 SpinLock 방식은 락 획득 실패 시 지속적으로 Redis에 재요청을 보내기 때문에 대기중인 스레드가 많을수록 네트워크 트래픽과 Redis 부하가 많아짐
+    반면
+    Redisson 기반의 Signaling 방식은 락을 획득하지 못한 스레드는 추가적인 요청없이 대기하고, 락이 해제될 때 알림을 받아 재시도함
+
+<br>
+
+#### 🚗 Redisson의 Pub/Sub과 스레드의 과정
+
+```txt
+Thread-A: lock 획득 성공
+Thread-B: lock 획득 실패
+        -> Redisson이 락 채널 subscribe
+        -> Thread-B는 wait 상태로 대기함
+
+Thread-A: unlock()
+        -> Redisson이 unlock + publish(Lock을 다 사용했으니 이제 너네들 락 써~)
+
+Redisson 내부 I/O 스레드:
+        -> publish 메시지 수신(야 Lock 쓸 수 있대!)
+        -> 대기 중이던 Thread-B 쪽에 "다시 시도 가능" 신호 전달
+
+Thread-B:
+        -> 깨어나서 다시 tryLock / lock 획득 시도
+```
+
