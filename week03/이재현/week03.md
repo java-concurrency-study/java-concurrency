@@ -28,7 +28,7 @@
 
 -> 이를 이해하려면 `park()` / `unpark()`를 알아야 한다.
 
--> `ReentrantLock.lock()`은 내부적으로 `LockSupport.park()`를 호출한다. `park()`는 JVM에게 "이 가상 스레드를 잠시 멈춰도 된다"는 신호를 주어, 가상 스레드를 캐리어 스레드에서 언마운트시킨다.
+-> `ReentrantLock.lock()`은 내부적으로 `LockSupport.park()`를 호출한다. `park()`는 JVM에게 "이 가상 스레드를 잠시 멈춰도 된다"는 신호를 주어, 가상 스레드를 캐리어 스레드에서 언마운트시킨다. (그렇다고 lock이 park()을 무조건 호출하는 것은 아니고, 경합 시 park/unpark 기반으로 대기할 수 있음에 가까울 듯 하다)
 
 -> 락이 해제되면 `LockSupport.unpark(thread)`가 호출되어 가상 스레드가 다시 마운트 가능 상태로 전환된다.
 
