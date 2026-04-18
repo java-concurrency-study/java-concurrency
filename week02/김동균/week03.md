@@ -1,0 +1,741 @@
+# 최신 동시성 매커니즘
+
+<br>
+
+## 1. 스레드 풀
+
+#### 기본 동작 원리
+
+- 스레드 풀에는 task를 담아놓는 큐가 있으며, task가 큐에 들어오면 스레드 풀에서 사용 가능한 스레드가 있으면 즉시 큐에서 task를 가져가 실행함
+
+#### 스레드 풀이 필요한 이유
+
+1. 매 요청마다 스레드를 만들면 메모리가 낭비됨
+2. 개발자가 직접 스레드의 생명주기를 관리하지 않아도되고, 비지니스 로직에만 집중 가능
+3. 메모리 누수 방지
+
+<br>
+
+## 2. Executor Framework
+
+- Executors 클래스는 편의성을 높이기 위해 여러 정적 팩토리 메서드를 지원해줌
+
+<br>
+
+### 2-1. 주요 설정값들
+
+#### corePoolSize
+
+- `allowCoreThreadTimeOut(default: false)` 설정에 따라 기본적으로 유지될 수 있는 스레드의 수
+    - **allowCoreThreadTimeOut**: false
+        - `corePoolSize`를 설정한 만큼 기본적으로 스레드가 유지됨
+    - **allowCoreThreadTimeOut**: true
+        - `keepAliveTime` 시간만큼 유지되고, `keepAliveTime` 시간이 지나면 설정한 코어 개수의 스레드도 제거됨
+
+#### maximumPoolSize
+
+- core 스레드가 모두 사용 중이고 workQueue도 task기 가득 찼을 때만 core를 초과하는 스레드가 생성됨
+
+#### keepAliveTime
+
+- 유휴 스레드들을 언제 정리할지 결정하는 시간
+- `maximumPoolSize` 설정에 의해 추가적으로 만들어진 스레드에 적용됨
+- 만약, `allowCoreThreadTimeOut(true)`로 설정하여 `corePoolSize`를 세팅했다면 이에도 적용됨
+
+#### workQueue
+
+- Executor에 들어온 task를 대기시키는 큐
+- 버퍼의 역할을 함
+
+#### RejectedExecutionHandler
+
+- ThreadPool이 처리 한계를 초과했을 때, 추가적으로 들어오는 task에 대해 어떻게 처리할지 결정하는 전략
+
+#### 📌 CPU 버스트인 경우
+
+- CPU 집중적인 작업이 많다면 **corePoolSize**를 사용 가능한 CPU 코어수와 맞추는게 좋음
+- 스레드가 과도하게 많다면 컨텍스트 전환, CPU 캐시 비효율화 등이 발생할 수 있음
+- CPU 집중적인 작업에서는 동시에 많이 처리한다고해서 처리량이 선형적으로 증가되지 않음, 이때 **사용 가능한 CPU 코어수**보다 많다면 오히려 CPU를 차지하기 위해 경쟁만 심해짐
+- **Queue**는 유한큐를 사용하여 처리할 수 있는 만큼만 처리하는게 좋을거 같음(backpressure)
+
+#### 📌 I/O 버스트인 경우
+
+- I/O 집중적인 작업이 많다면 **Blocking**되어 입출력을 기다리는 동안 다른 작업을 처리할 수 있도록 코어 수보다 많은 스레드를 설정하는게 좋음
+- 공식
+    - 사용 가능한 CPU 코어수: 8개라는 가정
+    - corePoolSize: 8 (코어 수)
+    - maximumPoolSize: 40 (코어 수 * 2 ~ 10)
+    - queue: bounded queue
+- 하지만 DB Connection Pool, HTTP Connection Pool도 항상 고려해야함, 보통 외부 시스템이 처리량이 더 적음
+    - 예를들어 HikariCP의 maximumPoolSize가 10인데, I/O 스레드가 많다면 DB Connection을 기다리게됨
+
+<br>
+
+### 2-2. 여러 RejectedExecutionHandler
+
+#### 예제 코드
+
+- for문에서 11개까지 설정한 이유는 코드의 세팅값은 동시에 실행 시킬 수 있는 task의 수는 10개이기 때문에 의도적으로 예외를 발생시키기 위함
+- 동시에 처리 가능한 수 10 = maximumPoolSize = 5 + workQueue = 5
+
+```java
+public class ThreadPoolExecutorRejectedExample {
+
+    public static void main(String[] args) {
+        int corePoolSize = 3;
+        int maximumPoolSize = 5;
+        long keepAliveTime = 10;
+        BlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(5);
+        RejectedExecutionHandler handler = new ThreadPoolExecutor.AbortPolicy(); // 정책이 변경되면서 테스트 진행 및 결과 도출
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue, handler);
+
+        for (int i = 1; i <= 11; i++) { // 의도적으로 종료 지점을 11로 설정함
+            int taskId = i;
+            executor.execute(() -> {
+                try {
+                    System.out.printf("시작 - task=%d, thread=%s, poolSize=%d, active=%d, queue=%d%n", taskId, Thread.currentThread().getName(), executor.getPoolSize(), executor.getActiveCount(), executor.getQueue().size());
+
+                    Thread.sleep(1000);
+
+                    System.out.printf("종료 - task=%d, thread=%s, poolSize=%d, active=%d, queue=%d%n", taskId, Thread.currentThread().getName(), executor.getPoolSize(), executor.getActiveCount(), executor.getQueue().size());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        executor.shutdown();
+    }
+}
+```
+
+<br>
+
+#### ThreadPoolExecutor.AbortPolicy
+
+- 기본으로 적용되어 있는 정책
+- Reject된 task가 RejectedExecutionException을 발생시킴
+
+<details>
+	<summary>예제 결과</summary>
+
+```txt
+Exception in thread "main" java.util.concurrent.RejectedExecutionException: Task ExecutorsExample$$Lambda/0x0000000800002a00@614c5515 rejected from java.util.concurrent.ThreadPoolExecutor@3fb6a447[Running, pool size = 5, active threads = 5, queued tasks = 5, completed tasks = 0]
+	at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2081)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:841)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1376)
+	at ExecutorsExample.main(ExecutorsExample.java:16)
+시작 - task=1, thread=pool-1-thread-1, poolSize=2, active=2, queue=0
+시작 - task=2, thread=pool-1-thread-2, poolSize=4, active=4, queue=5
+시작 - task=3, thread=pool-1-thread-3, poolSize=4, active=4, queue=5
+시작 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+시작 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+```
+</details>
+
+<br>
+
+#### ThreadPoolExecutor.CallerRunsPolicy
+
+- reject된 task를 **execute**를 호출한 스레드가 직접 실행함
+- 호출한 스레드의 **응답 지연**이 발생할 수 있음
+
+<details>
+	<summary>예제 결과</summary>
+
+```txt
+시작 - task=2, thread=pool-1-thread-2, poolSize=3, active=3, queue=0
+시작 - task=1, thread=pool-1-thread-1, poolSize=3, active=3, queue=0
+시작 - task=3, thread=pool-1-thread-3, poolSize=4, active=4, queue=5
+시작 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+시작 - task=11, thread=main, poolSize=5, active=5, queue=5 -- 메인 스레드에서 작업이 이루어진걸 알 수 있음
+시작 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+종료 - task=11, thread=main, poolSize=5, active=5, queue=5
+종료 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+종료 - task=1, thread=pool-1-thread-1, poolSize=5, active=5, queue=5
+종료 - task=3, thread=pool-1-thread-3, poolSize=5, active=5, queue=5
+시작 - task=6, thread=pool-1-thread-3, poolSize=5, active=5, queue=2
+종료 - task=2, thread=pool-1-thread-2, poolSize=5, active=5, queue=5
+종료 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+시작 - task=8, thread=pool-1-thread-5, poolSize=5, active=5, queue=0
+시작 - task=4, thread=pool-1-thread-4, poolSize=5, active=5, queue=4
+시작 - task=5, thread=pool-1-thread-1, poolSize=5, active=5, queue=3
+시작 - task=7, thread=pool-1-thread-2, poolSize=5, active=5, queue=1
+종료 - task=6, thread=pool-1-thread-3, poolSize=5, active=5, queue=0
+종료 - task=8, thread=pool-1-thread-5, poolSize=5, active=5, queue=0
+종료 - task=5, thread=pool-1-thread-1, poolSize=5, active=5, queue=0
+종료 - task=4, thread=pool-1-thread-4, poolSize=5, active=5, queue=0
+종료 - task=7, thread=pool-1-thread-2, poolSize=5, active=5, queue=0
+```
+</details>
+
+<br>
+
+#### ThreadPoolExecutor.DiscardPolicy
+
+- reject된 task를 버리고, 예외도 발생하지 않음
+- 메시지 유실됨
+- 예제 결과를 보면 **task=11**은 보이지 않으며, 예외도 없음
+
+<details>
+	<summary>예제 결과</summary>
+
+```txt
+시작 - task=1, thread=pool-1-thread-1, poolSize=3, active=3, queue=0
+시작 - task=2, thread=pool-1-thread-2, poolSize=3, active=3, queue=5
+시작 - task=3, thread=pool-1-thread-3, poolSize=4, active=4, queue=5
+시작 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+시작 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+종료 - task=2, thread=pool-1-thread-2, poolSize=5, active=5, queue=5
+종료 - task=3, thread=pool-1-thread-3, poolSize=5, active=5, queue=5
+종료 - task=1, thread=pool-1-thread-1, poolSize=5, active=5, queue=5
+시작 - task=6, thread=pool-1-thread-1, poolSize=5, active=5, queue=2
+시작 - task=4, thread=pool-1-thread-2, poolSize=5, active=5, queue=4
+시작 - task=5, thread=pool-1-thread-3, poolSize=5, active=5, queue=3
+종료 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=3
+시작 - task=7, thread=pool-1-thread-4, poolSize=5, active=5, queue=1
+종료 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=3
+시작 - task=8, thread=pool-1-thread-5, poolSize=5, active=5, queue=0
+종료 - task=6, thread=pool-1-thread-1, poolSize=5, active=5, queue=0
+종료 - task=5, thread=pool-1-thread-3, poolSize=4, active=4, queue=0
+종료 - task=4, thread=pool-1-thread-2, poolSize=4, active=4, queue=0
+종료 - task=8, thread=pool-1-thread-5, poolSize=4, active=4, queue=0
+종료 - task=7, thread=pool-1-thread-4, poolSize=3, active=3, queue=0
+```
+</details>
+
+<br>
+
+#### ThreadPoolExecutor.DiscardOldestPolicy
+
+- 큐에서 가장 오래 기다리던 작업을 버리고 새 작업을 다시 넣으려 시도함
+- 실행 결과는 DiscardPolicy와 동일하고, 메시지 유실됨
+- 예제 결과를 보면 **task=4** 번은 유실되고, **task=11**번이 수행됨
+
+<details>
+	<summary>예제 결과</summary>
+
+```txt
+시작 - task=1, thread=pool-1-thread-1, poolSize=5, active=5, queue=5
+시작 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+시작 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+시작 - task=2, thread=pool-1-thread-2, poolSize=5, active=5, queue=5
+시작 - task=3, thread=pool-1-thread-3, poolSize=5, active=5, queue=5
+종료 - task=10, thread=pool-1-thread-5, poolSize=5, active=5, queue=5
+종료 - task=9, thread=pool-1-thread-4, poolSize=5, active=5, queue=5
+종료 - task=1, thread=pool-1-thread-1, poolSize=5, active=5, queue=5
+종료 - task=2, thread=pool-1-thread-2, poolSize=5, active=4, queue=4
+시작 - task=8, thread=pool-1-thread-2, poolSize=5, active=5, queue=1
+시작 - task=5, thread=pool-1-thread-5, poolSize=5, active=5, queue=4
+시작 - task=6, thread=pool-1-thread-4, poolSize=5, active=5, queue=3
+시작 - task=7, thread=pool-1-thread-1, poolSize=5, active=5, queue=2
+종료 - task=3, thread=pool-1-thread-3, poolSize=5, active=5, queue=1
+시작 - task=11, thread=pool-1-thread-3, poolSize=5, active=5, queue=0
+종료 - task=8, thread=pool-1-thread-2, poolSize=5, active=5, queue=0
+종료 - task=6, thread=pool-1-thread-4, poolSize=5, active=5, queue=0
+종료 - task=5, thread=pool-1-thread-5, poolSize=5, active=5, queue=0
+종료 - task=7, thread=pool-1-thread-1, poolSize=5, active=5, queue=0
+종료 - task=11, thread=pool-1-thread-3, poolSize=1, active=1, queue=0
+```
+</details>
+
+<br>
+
+#### 📌 커스텀 RejectedExecutionHandler
+
+- 실제 업무 환경에서는 메시지 유실을 최소화해야하기 때문에 보통 `CallerRunsPolicy`을 사용하고, 로깅을 통해 스레드 풀 수정
+
+```java
+public class ThreadPoolExecutorRejectedExample {
+
+    public static void main(String[] args) {
+        int corePoolSize = 3;
+        int maximumPoolSize = 5;
+        long keepAliveTime = 10;
+        BlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(5);
+        RejectedExecutionHandler handler = new CustomRejectedExecutionHandler();
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.SECONDS, workQueue, handler);
+
+        for (int i = 1; i <= 11; i++) {
+            int taskId = i;
+            executor.execute(() -> {
+                try {
+                    System.out.printf("시작 - task=%d, thread=%s, poolSize=%d, active=%d, queue=%d%n", taskId, Thread.currentThread().getName(), executor.getPoolSize(), executor.getActiveCount(), executor.getQueue().size());
+
+                    Thread.sleep(1000);
+
+                    System.out.printf("종료 - task=%d, thread=%s, poolSize=%d, active=%d, queue=%d%n", taskId, Thread.currentThread().getName(), executor.getPoolSize(), executor.getActiveCount(), executor.getQueue().size());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        executor.shutdown();
+    }
+
+    public static class CustomRejectedExecutionHandler implements RejectedExecutionHandler {
+
+        @Override
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+            System.err.println("Task rejected: " + r);
+            r.run();
+        }
+    }
+}
+```
+
+<br>
+
+### 2-3. 스프링의 ThreadPoolTaskExecutor
+
+- ThreadPoolTaskExecutor는 내부적으로 ThreadPoolExecutor를 기반으로 동작하는 Spring의 래퍼 클래스임
+- 따라서 corePoolSize, maximumPoolSize, workQueue와 같은 핵심 개념과 동작 원리는 동일함
+
+#### 예제 코드
+
+```java
+@EnableAsync
+@Configuration
+public class AsyncConfig {
+
+    @Bean("taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(3);
+        executor.setMaxPoolSize(5);
+        executor.setQueueCapacity(5);
+        executor.setThreadNamePrefix("async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy()); // 해당 설정을 통해 reject된 task를 호출한 스레드가 직접 실행하도록함
+        executor.initialize();
+        return executor;
+    }
+}
+
+@RestController
+@RequiredArgsConstructor
+public class TestController {
+
+    private final OrderService orderService;
+
+    @GetMapping("/test")
+    public String test() {
+        String callerThread = Thread.currentThread().getName();
+        System.out.println("[Controller] 호출자 thread = " + callerThread);;
+
+        for (int i = 1; i <= 20; i++) {
+            orderService.order("task-" + i);
+        }
+
+        System.out.println("[Controller] 모든 order 호출 완료 / thread = " + Thread.currentThread().getName());
+        return "ok";
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final NotificationService notificationService;
+
+    public void order(String name) {
+        String threadName = Thread.currentThread().getName();
+
+        System.out.println("[Order] 시작 - " + name + " / thread=" + threadName);
+
+        notificationService.send(name + "주문이 완료되었습니다.");
+
+        System.out.println("[Order] 종료 - " + name + " / thread=" + threadName);
+    }
+}
+
+@Service
+public class NotificationService {
+
+    @Async("taskExecutor")
+    public void send(String message) {
+        try {
+            String threadName = Thread.currentThread().getName();
+            System.out.println("[Async] 시작 - message=" + message + " / thread=" + threadName);
+            Thread.sleep(1000);
+            System.out.println("[Async] 종료 - message=" + message + " / thread=" + threadName);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+<br>
+
+#### 예제 결과
+
+- 아래 결과를 보면 **task-11**이 실행되고 reject되어 결국 호출자 스레드에서 실행되는 것을 알 수 있음
+
+```txt
+[Controller] 호출자 thread = http-nio-8080-exec-2
+[Order] 시작 - task-1 / thread=http-nio-8080-exec-2
+[Async] 시작 - message=task-3주문이 완료되었습니다. / thread=async-3
+... 생략
+[Async] 시작 - message=task-1주문이 완료되었습니다. / thread=async-1
+[Async] 시작 - message=task-2주문이 완료되었습니다. / thread=async-2
+... 생략
+[Order] 시작 - task-10 / thread=http-nio-8080-exec-2
+[Async] 시작 - message=task-9주문이 완료되었습니다. / thread=async-4
+[Order] 종료 - task-10 / thread=http-nio-8080-exec-2
+[Order] 시작 - task-11 / thread=http-nio-8080-exec-2 <<< task-11을 시작하는 스레드
+[Async] 시작 - message=task-10주문이 완료되었습니다. / thread=async-5
+[Async] 시작 - message=task-11주문이 완료되었습니다. / thread=http-nio-8080-exec-2 <<<< task가 reject되어 호출자 스레드에서 실행된걸 알 수 있음
+```
+
+<br>
+
+#### RejectedExecutionHandler를 AbortPolicy 설정하고 재시도
+
+- 당연하게도 예외가 발생한것을 알 수 있음
+
+```txt
+java.util.concurrent.RejectedExecutionException: Task java.util.concurrent.FutureTask@6dd17b1a[Not completed, task = org.springframework.aop.interceptor.AsyncExecutionInterceptor$$Lambda/0x0000000800d3b438@4ed825c8] rejected from org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor$1@7441eed3[Running, pool size = 5, active threads = 5, queued tasks = 5, completed tasks = 0]
+	at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2081) ~[na:na]
+	at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:841) ~[na:na]
+	at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1376) ~[na:na]
+  ... 생략
+  at com.story_weave.kdg.OrderService.order(OrderService.java:17) ~[classes/:na] << NotificationService 클래스의 send 메서드 호출 구간
+	at com.story_weave.kdg.TestController.test(TestController.java:20) ~[classes/:na]
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
+```
+
+<br>
+
+### 2-4. Executors의 여러 정적 메서드
+
+#### FixedThreadPool
+
+- 스레드의 개수가 고정되어 있는 풀
+- 작업 큐는 무제한 큐를 사용함 (capacity가 21억으로 설정되어 있음)
+
+```java
+public static ExecutorService newFixedThreadPool(int nThreads) {
+	return new ThreadPoolExecutor(nThreads, nThreads,
+								  0L, TimeUnit.MILLISECONDS,
+								  new LinkedBlockingQueue<Runnable>()); // capacity가 Integer.MAX_VALUE로 설정되어 있음
+}
+```
+
+<br>
+
+#### CachedThreadPool
+
+- 이전에 생성된 스레드가 유휴 상태라면 재사용하고, 유휴 상태의 스레드가 없다면 새로운 스레드를 생성함
+- `SynchronousQueue` 큐를 사용하기 때문에 버퍼가 없음, 따라서 작업을 저장하지 않고 스레드에게 바로 넘김 그렇기 때문에 스레드가 계속하여 만들어짐
+- **CachedThreadPool**는 스레드를 계속 만들수 있고 이는 결국 **OOM**을 발생시키므로 실무에서는 사용하지 않는게 좋음
+
+```java
+public static ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+	return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+								  60L, TimeUnit.SECONDS,
+								  new SynchronousQueue<Runnable>(), // SynchronousQueue는 버퍼가 없는 큐임
+								  threadFactory);
+}
+```
+
+<br>
+
+#### ScheduledThreadPool
+
+- 지연된 시간 후 실행되거나 일정한 간격으로 반복 실행되도록 태스크를 스케줄링함
+- **maximumPoolSize** 설정이 없어서 **corePoolSize**로만 동작함
+
+```java
+public ScheduledThreadPoolExecutor(int corePoolSize) {
+	super(corePoolSize, Integer.-MAX_VALUE,
+		  DEFAULT_KEEPALIVE_MILLIS, MILLISECONDS,
+		  new DelayedWorkQueue());
+}
+```
+
+<br>
+
+## 3. ForkJoinPool
+
+- **ForkJoinPool**은 `Work-Stealing` 매커니즘을 사용함
+- **ForkJoinPool**은 큰 작업을 더 작은 작업으로 재귀적으로 분할할 수 있도록 설계되어 있음
+
+<br>
+
+### 3-1. ForkJoinPool에서의 CPU 집중적인 작업과 I/O 집중적인 작업
+
+#### CPU 집중적인 작업
+
+- CPU 집중적인 작업에서 스레드의 수는 가용 프로세스의 수보다 많은 스레드를 설정하더라도 CPU 시간을 두고 경쟁하기 때문에 많은 스레드는 오히려 컨텍스트 스위치의 오버헤드만 증가하게 만듬
+- 실제로는 CPU 코어 수만큼의 스레드가 동시에 실행될 수 있기 때문에 나머지 스레드들은 대기하게되어 성능상 이점이 없음
+
+#### I/O 집중적인 작업
+
+- I/O 집중적인 작업에서는 일부 스레드가 I/O 작업으로 인해 블로킹되어 있을 때, 다른 스레드들이 계속하여 작업을 할 수 있기 때문에 가용 프로세스의 수보다 많은 스레드를 설정하더라도 이득이 있음
+
+<br>
+
+### 3-2. ForkJoinPool에서 가상 스레드가 동작하는 방법
+
+- ForkJoinPool에는 각각의 워커 스레드들이 있고, 자신만의 `deque`를 가짐
+- 각 워커 스레드들은 작업을 **LIFO** 방식으로 넣고 꺼냄
+- 다른 스레드들은 다른 워커 스레드의 큐에서 **FIFO** 방식으로 작업을 훔쳐옴
+
+#### 💡 워커 스레드와 deque
+
+- head는 다른 스레드가 작업을 훔쳐가는 쪽(`LIFO`)
+- tail은 자신의 작업을 꺼내는 쪽(`FIFO`)
+
+```txt
+Worker Thread
+   │
+   └── Deque
+               ┌────┬────┬────┬────┐
+head(FIFO) →   │ A  │ B  │ C  │ D  │   ← tail(LIFO)
+               └────┴────┴────┴────┘
+```
+
+<br>
+
+#### 💡 각자의 deque를 가지는 이유
+
+- 모든 워커 스레드가 하나의 **공유 큐**를 사용하면 작업을 가져갈 때마다 동기화를 해야하기 때문에 성능 저하가 발생함
+- 대신 각자의 `deque`를 가지고 있으면 아래와 같은 장점이 있음
+    1. CAS 알고리즘을 사용하여 락 최소화
+    2. 작업 큐를 소유한 워커 스레드는 **tail**에서 pop하여 앞쪽의 작업을 가져옴(`참조 지역성의 원리`)
+    3. 도둑 스레드는 다른 스레드의 작업 큐의 **head**에서 뒤쪽 작업을 가져옴(`작업 분할`)
+
+<br>
+
+## 4. Continuation
+
+### 4-1. 기본 개념
+
+#### 💡 Continuation란?
+
+- `Continuation`는 가상 스레드의 현재 실행 상태를 `Heap`에 저장하고, 이후 다른 캐리어 스레드에 의해 다시 작업이 재개될 때 다시 복구하여 작업을 실행할 수 있도록 해주는 매커니즘
+
+<br>
+
+#### 💡 Context-Swich란?
+
+- `Context-Swich`는 현재까지의 작업 정보(PC, CPU 레지스터 값, 스택 포인터 등)를 `커널 메모리 블럭(TCB)`에 저장하고, 다른 스레드로 전환하는 과정
+- 그리고 해당 플랫폼 스레드와 1:1 매핑된 커널 스레드는 여전히 남아있음
+
+<br>
+
+#### Continuation과 Context-Swich의 차이?
+
+1. 플랫폼 스레드는 1:1 매핑된 커널 스레드에 의해서만 동작되어야 하고, 가상 스레드는 특정 캐리어 스레드에 종속되지 않고 어떠한 캐리어 스레드에 의해서도 동작될 수 있음
+2. Context-Swich는 CPU를 어떤 스레드가 쓸지 바꾸는 것이고, Continuation은 JVM 수준에서 실행 자체를 저장하고 재개하는 것
+3. 플랫폼 스레드의 스택 프레임은 실행이 중단되더라도 메모리에 유지하고 있지만 가상 스레드의 스택 프레임은 **unmount**될 때 `Heap`에 저장됨
+
+<br>
+
+#### 🤔 책에서 이상한 부분
+
+> 178p: 어떤 메서드에 여러 줄의 코드가 있다고 가정하자. 일반적으로 메서드가 호출되면 처음부터 끝까지 순차적으로 실행된다. 메서드가 중간에 종료되었다가 다시 호출되면 처음부터 다시 실행이 시작된다.
+
+<br>
+
+- 플랫폼 스레드도 Context Switch가 발생하면 TCB에 PC(Program Counter)가 저장되기 때문에 작업이 재개될 때 처음부터 실행되는 것이 아니라 중단된 지점부터 이어서 실행됨
+- 즉, 플랫폼 스레드는 단순히 CPU를 잠깐 빼앗긴 상태일 뿐이지 실행 상태(Stack Frame)는 메모리에 유지되고 있음
+- 아래 코드에서 step2() 실행 중 중단되더라도 스레드가 다시 실행되면 중단된 지점부터 이어서 실행된다
+
+```java
+void foo() {
+    step1();
+    step2();  // 여기서 중단
+    step3();
+}
+```
+
+<br>
+
+저자는 무슨 말을 하고싶었던걸까?
+
+- 가상 스레드도 Blocking I/O를 만나면 현재 실행 상태(`Stack Frame`)를 `Heap`에 저장하고, 다시 작업을 재개할 때 `Heap`에서 실행 상태를 복원하여 작업을 실행시킴,
+  다만 중요한 차이점은 플랫폼 스레드는 `Stack Frame`이 메모리에 유지된 상태에서 작업을 재개하는 것이지만 가상 스레드는 `Stack Frame`이 제거된 상태에서 작업을 재개할 때 다시 `Stack Frame`을 복원하는 것을 말하고 싶었던게 아닐까? 생각함
+
+<br>
+
+#### Continuation 흐름 예제
+
+<details>
+	<summary>예제 코드</summary>
+
+```txt
+> java --add-exports java.base/jdk.internal.vm=ALL-UNNAMED Main
+> javac --add-exports java.base/jdk.internal.vm=ALL-UNNAMED Main.java
+```
+
+```java
+import jdk.internal.vm.Continuation;
+import jdk.internal.vm.ContinuationScope;
+
+public class Main {
+
+    public static void main(String[] args) {
+
+        ContinuationScope scope = new ContinuationScope("main");
+
+        Continuation continuation = new Continuation(scope, () -> {
+            System.out.println("Hello from continuation");
+            Continuation.yield(scope);
+            System.out.println("Hello again from continuation");
+            Continuation.yield(scope);
+            System.out.println("Done from continuation");
+        });
+
+        System.out.println("Before starting continuation");
+        continuation.run();
+        System.out.println("After starting continuation");
+        continuation.run();
+        System.out.println("After starting continuation again");
+        continuation.run();
+    }
+}
+// 결과
+Before starting continuation
+Hello from continuation
+After starting continuation
+Hello again from continuation
+After starting continuation again
+Done from continuation
+```
+</details>
+
+<br>
+
+### 4-2. 지연 복사 매커니즘
+
+- 가상 스레드의 마운트/언마운트 과정에서 가상 스레드가 가지고 있던 스택 정보가 플랫폼 스래드의 스택 <-> Continuation으로 왔다갔다 복사가 되는데, 이때 호출 스택이 깊을 경우 복사 비용이 많이드는데 어떻게 해결할까?
+
+  > 컨티뉴에이션이 처음으로 일시 중단될 때는 전체 스택 프레임을 컨티뉴에이션 객체로 복사한다. <br>
+  그러나 컨티뉴에이션 객체가 다시 재개될 때는 컨티뉴에이션에 있던 스택 프레임 전체를 스레드의 스택으로 복사하지 않고, 한 두개만 복사한다. <br>
+  만약 스레드의 스택에 없는 스택을 호출한다면 `반환 배리어`라는 매커니즘이 적용되어 함수가 필요로 하는 프레임을 컨티뉴에이션 스택으로부터 복사해와야하는지 확인한다.
+
+#### 📌 반환 배리어
+
+- 함수 return 시점에 필요한 호출자의 스택 프레임이 없으면 Continuation에서 복원하는 것
+- `페이지 폴트`와 비슷한 개념을 사용하는거 같음
+    - CPU가 메모리에 접근했는데, 페이지가 없으면 **페이지 폴트**가 발생하여 디스크에서 페이지를 로드한 다음 다시 실행하는 과정임
+
+#### 🚗 반환 배리어의 동작 과정
+
+```txt
+[1. 가정]
+void foo() {
+    step1();
+    step2();  
+    step3();  // 여기서 중단(yield) -> 전체 스택을 Continuation(Heap)으로 복사
+    step4();
+}
+
+[2. 실행 중]
+[Thread Stack]
+foo → step1 → step2 → step3
+
+[3. yield: unmount]
+[Continuation]
+foo
+step1
+step2
+step3
+
+[4. resume]
+[Thread Stack]
+step3   ← 일부만 복원
+
+[Continuation] ← 나머지 저장
+foo
+step1
+step2
+
+[5. 문제 발생]
+// 즉 step3을 실행하고 step4를 실행 한 후 다시 step3로 되돌아오고 step3에서는 step2로 되돌아가야함, 이때 step2 프레임이 Thread Stack에 없음
+step3 → step4 → step3 return → step2로 돌아가야 함 
+
+[6. Return Barrier 실행됨]
+// 함수 return 시점에 필요한 호출자의 스택 프레임이 없으면 Continuation에서 복원함
+step3 → return 시도
+   ↓
+step2 프레임 필요
+   ↓
+Thread Stack에 없음
+   ↓
+Return Barrier 발동
+   ↓
+Continuation에서 step2 복원
+   ↓
+실행 계속
+```
+
+<br>
+
+### 4-3. 가상 스레드의 Blocking I/O 동작 과정
+
+1. 가상 스레드가 실행되면 `ForkJoinPool`의 **FIFO Queue**에 담기게 됨
+2. 캐리어 스레드가 `ForkJoinPool`의 **FIFO Queue**에서 작업을 가져와 자신의 작업 큐에 담아 놓음
+3. 캐리어 스레드는 자신의 작업 큐에서 가상 스레드 하나를 꺼내어(**mount**) 작업을 실행함
+4. 가상 스레드가 Blocking I/O를 만나면 캐리어 스레드와 **unmount**됨
+    1. 가상 스레드는 블럭킹 상태이므로 `Wait` 상태가 되어 실행 중이던 스택 정보를 `Continuation`에 저장함
+    2. 가상 스레드의 I/O 작업이 완료되면  상태가 `Runnable`이 되고, **JVM**은 `ForkJoinPool`의 **FIFO Queue**에 넣음
+    3. 캐리어 스레드가 `ForkJoinPool`의 **FIFO Queue**에서 작업을 가져와 자신의 작업 큐에 담아 놓고, 실행된다면 `Continuation`을 복구하여 실행함(**remount**)
+5. 캐리어 스레드는 자신의 작업 큐에서 다른 가상 스레드와 **mount**되어 작업을 실행함
+6. 캐리어 스레드는 자신의 작업 큐가 비게되면 다른 캐리어 스레드의 작업 큐에서 작업을 훔쳐옴(**Stealing** 동작)
+
+#### 🚗 과정으로 이해하기
+
+```txt
+[1] Virtual Thread 생성 및 실행
+        ↓
+[2] ForkJoinPool (Global FIFO Queue)에 등록
+        ↓
+[3] Carrier Thread (Platform Thread)
+        ↓  (task 가져오기)
+ ┌────────────────────────────┐
+ │ Carrier Thread Local Queue │
+ └────────────────────────────┘
+        ↓
+[4] mount → Virtual Thread 실행
+        ↓
+ ┌────────────────────────────┐
+ │ Virtual Thread 실행 중     │
+ └────────────────────────────┘
+        ↓
+[5] Blocking I/O 발생
+        ↓
+[6] unmount
+    - Virtual Thread → Wait 상태 전환
+    - Continuation에 스택 정보 저장
+    - Carrier Thread 해방
+        ↓
+[7] Carrier Thread → 다른 Virtual Thread 실행 (mount)
+        ↓
+[8] Blocking I/O가 완료되면 → 해당 Virtual Thread 상태 Runnable
+        ↓
+[9] ForkJoinPool (Global FIFO Queue)에 다시 등록
+        ↓
+[10] Carrier Thread가 작업을 가져와 Local Queue에 적재
+        ↓
+[11] remount → Continuation 복구 → 실행 재개
+        ↓
+[12] Local Queue가 비면 → 다른 Carrier Thread Queue에서 Stealing
+```
+
+<br>
+
+#### 🧐 가상 스레드의 I/O 작업이 완료되었다는 것을 어떻게 알까?
+
+1. 가상 스레드가 요청한 I/O 작업이 완료되면 OS가 **JVM**에게 알림
+2. 알림을 받은 **JVM**의 `I/O Poller`가 힙 영역에 있던 가상 스레드의 `Continuation`을 찾음
+3. `Poller`가 가상 스레드의 상태를 `Runnable`로 변경함
+
+<br>
+
+#### 참고
+
+- https://techblog.lycorp.co.jp/ko/about-java-virtual-thread-2
+
+
