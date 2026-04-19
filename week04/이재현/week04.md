@@ -94,19 +94,6 @@ ExecutorService service = Executors.newFixedThreadPool(10);
 
 ---
 
-### 7. ThreadFactory는 무엇이고 왜 쓰는가?
-
--> `ThreadFactory`는 스레드 풀이 새 스레드를 생성할 때 호출하는 팩토리 인터페이스다.
-
--> 스레드 이름, 데몬 여부, 우선순위, ThreadGroup 등을 커스터마이징할 수 있다.
-
-```java
-public ThreadPoolExecutor(int corePoolSize, ...,
-    ThreadFactory threadFactory, ...) { ... }
-```
-
----
-
 ## 3부. Callable과 Future
 
 ---
